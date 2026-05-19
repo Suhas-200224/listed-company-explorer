@@ -1,0 +1,25 @@
+ticker,name,sector,city
+DRREDDY.NS,Dr. Reddy's Laboratories,Healthcare,Hyderabad
+DIVISLAB.NS,Divi's Laboratories,Healthcare,Hyderabad
+AUROPHARMA.NS,Aurobindo Pharma,Healthcare,Hyderabad
+GRANULES.NS,Granules India,Healthcare,Hyderabad
+NATCOPHARM.NS,Natco Pharma,Healthcare,Hyderabad
+LAURUSLABS.NS,Laurus Labs,Healthcare,Hyderabad
+GLAND.NS,Gland Pharma,Healthcare,Hyderabad
+CYIENT.NS,Cyient,Technology,Hyderabad
+TANLA.NS,Tanla Platforms,Technology,Hyderabad
+NCC.NS,NCC Limited,Industrials,Hyderabad
+KNRCON.NS,KNR Constructions,Industrials,Hyderabad
+GMRINFRA.NS,GMR Airports Infrastructure,Industrials,Hyderabad
+BDL.NS,Bharat Dynamics,Industrials,Hyderabad
+MIDHANI.NS,Mishra Dhatu Nigam,Industrials,Hyderabad
+NMDC.NS,NMDC Limited,Basic Materials,Hyderabad
+HERITGFOOD.NS,Heritage Foods,Consumer Defensive,Hyderabad
+RELIANCE.NS,Reliance Industries,Energy,Mumbai
+TCS.NS,Tata Consultancy Services,Technology,Mumbai
+HDFCBANK.NS,HDFC Bank,Financial Services,Mumbai
+ICICIBANK.NS,ICICI Bank,Financial Services,Mumbai
+INFY.NS,Infosys,Technology,Bangalore
+WIPRO.NS,Wipro,Technology,Bangalore
+BHARTIARTL.NS,Bharti Airtel,Communication Services,Delhi
+MARUTI.NS,Maruti Suzuki India,Consumer Cyclical,Delhi

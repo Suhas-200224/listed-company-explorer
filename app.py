@@ -1,7 +1,11 @@
-"""Listed Company Explorer — v2.
+"""Listed Company Explorer — v4.
 
-Click-driven drill-down: sectors → companies → detail. Multi-select rows in
-the company list to compare. Geography pills at top. Polished card layouts.
+Layout:
+- Top bar: city dropdown (ALL cities) + search box
+- Home: KPIs + sector bar chart (clickable) + sector buttons as fallback
+- Sector view: top-companies chart (clickable) + full sortable table
+- Company view: detailed financials with charts
+- Search view: real-time filtered results across all companies
 """
 
 import streamlit as st
@@ -18,205 +22,163 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── Custom CSS ──────────────────────────────────────────────────────────────
-
 st.markdown("""
 <style>
     #MainMenu, footer, header {visibility: hidden;}
+    .block-container { padding-top: 1.2rem !important; padding-bottom: 2rem !important; max-width: 1400px; }
 
-    .block-container {
-        padding-top: 1.5rem !important;
-        padding-bottom: 2rem !important;
-        max-width: 1400px;
-    }
-
-    /* Metric cards */
     [data-testid="stMetric"] {
         background: rgba(255, 255, 255, 0.03);
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 12px;
-        padding: 14px 16px;
+        padding: 12px 16px;
     }
     [data-testid="stMetricLabel"] {
         font-size: 11px !important;
         color: rgba(255, 255, 255, 0.55) !important;
-        font-weight: 500 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
+        text-transform: uppercase; letter-spacing: 0.5px;
     }
-    [data-testid="stMetricValue"] {
-        font-size: 22px !important;
-        font-weight: 600 !important;
-    }
+    [data-testid="stMetricValue"] { font-size: 22px !important; font-weight: 600 !important; }
 
-    /* Sector cards */
-    .sector-card {
-        background: linear-gradient(135deg, rgba(55, 138, 221, 0.10), rgba(55, 138, 221, 0.02));
-        border: 1px solid rgba(55, 138, 221, 0.20);
-        border-radius: 12px;
-        padding: 16px 18px;
-        margin-bottom: 8px;
-        min-height: 110px;
-    }
-    .sector-name { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
-    .sector-meta { font-size: 12px; color: rgba(255, 255, 255, 0.55); margin-bottom: 10px; }
-    .sector-mcap { font-size: 22px; font-weight: 600; color: #378ADD; }
+    [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
 
-    /* Compact dataframe */
-    [data-testid="stDataFrame"] {
-        border-radius: 12px;
-        overflow: hidden;
-    }
-
-    /* Typography */
-    h1 { font-size: 28px !important; margin-bottom: 0.25rem !important; }
-    h2 { font-size: 22px !important; }
-    h3 { font-size: 17px !important; margin-top: 1rem !important; }
-
-    /* Geography pills */
-    .stRadio > div { flex-direction: row !important; flex-wrap: wrap; gap: 6px; }
-    .stRadio > div > label {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 20px;
-        padding: 6px 14px !important;
-        margin: 0 !important;
-        font-size: 13px;
-    }
-    .stRadio > div > label:has(input:checked) {
-        background: rgba(55, 138, 221, 0.18) !important;
-        border-color: rgba(55, 138, 221, 0.5) !important;
-        color: #fff !important;
-    }
+    h1 { font-size: 26px !important; margin-bottom: 0.25rem !important; }
+    h2 { font-size: 20px !important; }
+    h3 { font-size: 16px !important; margin-top: 0.5rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── State management ───────────────────────────────────────────────────────
+# ─── State init ─────────────────────────────────────────────────────────────
 
-def _init_state():
-    defaults = {
-        "view": "sectors",
-        "sel_sector": None,
-        "sel_company": None,
-        "geo_city": "Hyderabad",
-        "compare_tickers": [],
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-_init_state()
+for key, default in {
+    "view": "home",
+    "sel_sector": None,
+    "sel_company": None,
+    "geo_city": "All India",
+    "search_q": "",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# ─── Data load ──────────────────────────────────────────────────────────────
+# ─── Load data ─────────────────────────────────────────────────────────────
 
 companies, source = load_companies()
 if companies.empty:
-    st.error("No data available. Trigger the GitHub Actions workflow first.")
+    st.error("No data loaded. Trigger the GitHub Actions workflow.")
     st.stop()
 
 
-# ─── Geography options ─────────────────────────────────────────────────────
-
-def geo_options(df):
-    """Top cities by company count + 'All India' + 'Other'."""
-    counts = df[df["city"] != "Unknown"]["city"].value_counts()
-    top = counts.head(7).index.tolist()
-    preferred_order = ["Hyderabad", "Mumbai", "Bangalore", "Delhi", "Chennai", "Pune", "Ahmedabad"]
-    top_ordered = [c for c in preferred_order if c in top] + [c for c in top if c not in preferred_order]
-    return ["All India"] + top_ordered[:7]
-
-
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# ─── Helpers ───────────────────────────────────────────────────────────────
 
 def fmt_cr(v):
-    if v is None or pd.isna(v):
-        return "—"
-    if abs(v) >= 1_00_000:
-        return f"₹{v/1_00_000:.2f}L Cr"
+    if v is None or pd.isna(v): return "—"
+    if abs(v) >= 1_00_000: return f"₹{v/1_00_000:.2f}L Cr"
     return f"₹{v:,.0f} Cr"
 
 def fmt_num(v, suffix=""):
-    if v is None or pd.isna(v):
-        return "—"
+    if v is None or pd.isna(v): return "—"
     return f"{v:,.1f}{suffix}"
 
 
-# ─── Header ────────────────────────────────────────────────────────────────
+# ─── HEADER: title + city dropdown + search ────────────────────────────────
 
-st.title("📊 Listed Company Explorer")
+st.markdown("# 📊 Listed Company Explorer")
 
-h1, h2 = st.columns([3.5, 1])
-with h1:
-    geo_choices = geo_options(companies)
-    cur = st.session_state.geo_city if st.session_state.geo_city in geo_choices else "All India"
-    selected = st.radio(
-        "Geography",
-        geo_choices,
-        index=geo_choices.index(cur),
-        horizontal=True,
-        label_visibility="collapsed",
-        key="geo_radio",
+t1, t2, t3 = st.columns([1.2, 2.5, 1])
+
+with t1:
+    # Build city list: sorted by company count, with counts shown
+    city_counts = (
+        companies[companies["city"].notna() & (companies["city"] != "Unknown")]
+        ["city"].value_counts()
     )
-    if selected != st.session_state.geo_city:
-        st.session_state.geo_city = selected
-        st.session_state.view = "sectors"
+    city_options = ["All India"] + [f"{c} ({n})" for c, n in city_counts.items()]
+    city_lookup = {f"{c} ({n})": c for c, n in city_counts.items()}
+    city_lookup["All India"] = "All India"
+
+    # Determine current display value
+    cur_display = "All India"
+    if st.session_state.geo_city != "All India":
+        for disp, raw in city_lookup.items():
+            if raw == st.session_state.geo_city:
+                cur_display = disp
+                break
+
+    sel_display = st.selectbox(
+        "City",
+        city_options,
+        index=city_options.index(cur_display) if cur_display in city_options else 0,
+        label_visibility="collapsed",
+    )
+    sel_city = city_lookup.get(sel_display, "All India")
+    if sel_city != st.session_state.geo_city:
+        st.session_state.geo_city = sel_city
+        st.session_state.view = "home"
         st.session_state.sel_sector = None
         st.session_state.sel_company = None
         st.rerun()
 
-with h2:
-    if source == "enriched":
-        st.markdown(
-            f"<div style='text-align:right; color:rgba(255,255,255,0.55); font-size:12px; padding-top:8px;'>"
-            f"<span style='color:#1D9E75;'>● Live data</span> · {len(companies):,} companies indexed</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f"<div style='text-align:right; color:#EF9F27; font-size:12px; padding-top:8px;'>"
-            f"⚠ Seed data only — auto-refresh hasn't run yet</div>",
-            unsafe_allow_html=True,
-        )
+with t2:
+    search = st.text_input(
+        "Search",
+        value=st.session_state.search_q,
+        placeholder="🔍 Search company, sector, or industry (e.g. 'reddy', 'pharma', 'cement')",
+        label_visibility="collapsed",
+    )
+    if search != st.session_state.search_q:
+        st.session_state.search_q = search
+        if search.strip():
+            st.session_state.view = "search"
+        elif st.session_state.view == "search":
+            st.session_state.view = "home"
+        st.rerun()
+
+with t3:
+    st.markdown(
+        f"<div style='text-align:right; padding-top:6px; color:rgba(255,255,255,0.5); font-size:12px;'>"
+        f"<span style='color:#1D9E75;'>● Live</span> · {len(companies):,} cos indexed</div>",
+        unsafe_allow_html=True,
+    )
 
 
-# Scope companies
+# ─── Apply city scope ──────────────────────────────────────────────────────
+
 if st.session_state.geo_city == "All India":
     scoped = companies.copy()
 else:
     scoped = companies[companies["city"] == st.session_state.geo_city].copy()
 
 
-# ─── Breadcrumb + back ─────────────────────────────────────────────────────
+# ─── Breadcrumb + back button ──────────────────────────────────────────────
 
 view = st.session_state.view
-
 bc1, bc2 = st.columns([0.10, 0.90])
 with bc1:
-    if view != "sectors":
+    if view in ("sector", "company", "search"):
         if st.button("← Back", use_container_width=True):
             if view == "company":
-                st.session_state.view = "companies" if st.session_state.sel_sector else "sectors"
-            elif view == "companies":
-                st.session_state.view = "sectors"
+                st.session_state.view = "sector" if st.session_state.sel_sector else "home"
+            elif view == "sector":
+                st.session_state.view = "home"
                 st.session_state.sel_sector = None
-            elif view == "compare":
-                st.session_state.view = "companies" if st.session_state.sel_sector else "sectors"
+            elif view == "search":
+                st.session_state.view = "home"
+                st.session_state.search_q = ""
             st.rerun()
-
 with bc2:
     crumbs = [st.session_state.geo_city]
-    if st.session_state.sel_sector:
+    if st.session_state.sel_sector and view != "search":
         crumbs.append(st.session_state.sel_sector)
     if view == "company" and st.session_state.sel_company:
-        co_row = scoped[scoped["ticker"] == st.session_state.sel_company]
-        if not co_row.empty:
-            crumbs.append(co_row.iloc[0]["name"])
-    if view == "compare":
-        crumbs.append(f"Compare ({len(st.session_state.compare_tickers)})")
+        co = companies[companies["ticker"] == st.session_state.sel_company]
+        if not co.empty:
+            crumbs.append(co.iloc[0]["name"])
+    if view == "search":
+        crumbs.append(f"Search: '{st.session_state.search_q}'")
     st.markdown(
-        f"<div style='color:rgba(255,255,255,0.45); font-size:13px; padding-top:8px;'>"
+        f"<div style='color:rgba(255,255,255,0.5); font-size:13px; padding-top:8px;'>"
         f"{' › '.join(crumbs)}</div>",
         unsafe_allow_html=True,
     )
@@ -225,10 +187,51 @@ st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW 1: SECTOR OVERVIEW
+# VIEW: SEARCH
 # ═══════════════════════════════════════════════════════════════════════════
 
-if view == "sectors":
+if view == "search":
+    q = st.session_state.search_q.strip().lower()
+    matches = companies[
+        companies["name"].fillna("").str.lower().str.contains(q, na=False) |
+        companies["ticker"].fillna("").str.lower().str.contains(q, na=False) |
+        companies["sector"].fillna("").str.lower().str.contains(q, na=False) |
+        companies["industry"].fillna("").str.lower().str.contains(q, na=False)
+    ].sort_values("market_cap_cr", ascending=False, na_position="last")
+
+    st.markdown(f"### {len(matches)} matches for '{st.session_state.search_q}'")
+
+    if matches.empty:
+        st.info("No matches. Try a shorter or different keyword.")
+    else:
+        display = matches[["ticker", "name", "sector", "city",
+                           "market_cap_cr", "revenue_cr", "profit_cr", "pe", "roe_pct"]].copy()
+        display["market_cap_cr"] = display["market_cap_cr"].apply(fmt_cr)
+        display["revenue_cr"] = display["revenue_cr"].apply(fmt_cr)
+        display["profit_cr"] = display["profit_cr"].apply(fmt_cr)
+        display["pe"] = display["pe"].apply(fmt_num)
+        display["roe_pct"] = display["roe_pct"].apply(lambda x: fmt_num(x, "%"))
+        display.columns = ["Ticker", "Name", "Sector", "City", "M.Cap", "Revenue", "PAT", "P/E", "RoE"]
+
+        event = st.dataframe(
+            display, hide_index=True, use_container_width=True, height=520,
+            on_select="rerun", selection_mode="single-row",
+        )
+        if event.selection.rows:
+            sel = matches.iloc[event.selection.rows[0]]
+            if st.button(f"📊 View {sel['name']} details →", type="primary"):
+                st.session_state.view = "company"
+                st.session_state.sel_company = sel["ticker"]
+                st.rerun()
+        else:
+            st.caption("Click a row to select a company, then click 'View details'.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW: HOME (sector chart)
+# ═══════════════════════════════════════════════════════════════════════════
+
+elif view == "home":
     agg = (
         scoped.groupby("sector", dropna=True)
         .agg(
@@ -236,48 +239,35 @@ if view == "sectors":
             total_mcap=("market_cap_cr", "sum"),
             total_revenue=("revenue_cr", "sum"),
             total_profit=("profit_cr", "sum"),
-            avg_growth=("revenue_growth_yoy", "mean"),
         )
         .reset_index()
         .sort_values("total_mcap", ascending=False)
     )
-    agg["share_pct"] = agg["total_mcap"] / agg["total_mcap"].sum() * 100
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Companies", f"{len(scoped):,}")
-    c2.metric("Aggregate market cap", fmt_cr(agg["total_mcap"].sum()))
-    c3.metric("Aggregate revenue", fmt_cr(agg["total_revenue"].sum()))
+    c2.metric("Market cap", fmt_cr(agg["total_mcap"].sum()))
+    c3.metric("Revenue", fmt_cr(agg["total_revenue"].sum()))
     c4.metric("Sectors", len(agg))
 
-    st.markdown("### Click a sector to drill in")
+    if agg.empty:
+        st.warning(f"No companies in {st.session_state.geo_city}. Pick a different city.")
+        st.stop()
 
-    n_cols = 3
-    for i in range(0, len(agg), n_cols):
-        cols = st.columns(n_cols)
-        for j, (_, row) in enumerate(agg.iloc[i:i + n_cols].iterrows()):
-            with cols[j]:
-                st.markdown(f"""
-                <div class='sector-card'>
-                    <div class='sector-name'>{row['sector']}</div>
-                    <div class='sector-meta'>{row['companies']} cos · {row['share_pct']:.1f}% share</div>
-                    <div class='sector-mcap'>{fmt_cr(row['total_mcap'])}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                if st.button(f"View {row['sector']}  →", key=f"sec_{row['sector']}", use_container_width=True):
-                    st.session_state.view = "companies"
-                    st.session_state.sel_sector = row["sector"]
-                    st.rerun()
+    st.markdown("### Sectors by market cap — click a bar OR a button below to drill in")
 
-    st.markdown("### Sector breakdown — market cap share")
+    # Clickable sector chart
     fig = px.bar(
-        agg,
-        x="total_mcap", y="sector",
-        orientation="h",
-        text=agg["share_pct"].apply(lambda x: f"{x:.1f}%"),
+        agg, x="total_mcap", y="sector", orientation="h",
+        text=agg["total_mcap"].apply(fmt_cr),
+        custom_data=["sector", "companies"],
         labels={"total_mcap": "Market cap (₹ Cr)", "sector": ""},
-        height=max(280, 36 * len(agg)),
+        height=max(350, 38 * len(agg)),
     )
-    fig.update_traces(marker_color="#378ADD", textposition="outside")
+    fig.update_traces(
+        marker_color="#378ADD", textposition="outside",
+        hovertemplate="<b>%{customdata[0]}</b><br>Market cap: ₹%{x:,.0f} Cr<br>%{customdata[1]} companies<extra></extra>",
+    )
     fig.update_layout(
         yaxis={"categoryorder": "total ascending"},
         margin=dict(l=10, r=80, t=10, b=10),
@@ -285,75 +275,117 @@ if view == "sectors":
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="rgba(255,255,255,0.8)"),
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# VIEW 2: COMPANIES IN SECTOR
-# ═══════════════════════════════════════════════════════════════════════════
-
-elif view == "companies":
-    sec = st.session_state.sel_sector
-    df = scoped[scoped["sector"] == sec].copy() if sec else scoped.copy()
-
-    st.markdown(f"### {sec or 'All sectors'} · {len(df)} companies")
-
-    sort_by = st.radio(
-        "Sort by",
-        ["Market cap", "Revenue", "PAT", "RoE", "Revenue growth", "P/E"],
-        horizontal=True,
-        label_visibility="collapsed",
+    event = st.plotly_chart(
+        fig, use_container_width=True,
+        on_select="rerun", selection_mode="points",
+        key="sector_chart",
     )
-    sort_map = {"Market cap": "market_cap_cr", "Revenue": "revenue_cr", "PAT": "profit_cr",
-                "RoE": "roe_pct", "Revenue growth": "revenue_growth_yoy", "P/E": "pe"}
-    df = df.sort_values(sort_map[sort_by], ascending=(sort_by == "P/E"), na_position="last").reset_index(drop=True)
 
+    if event and hasattr(event, "selection") and event.selection.get("points"):
+        try:
+            clicked_sector = event.selection["points"][0].get("y") or \
+                             event.selection["points"][0].get("customdata", [None])[0]
+            if clicked_sector and clicked_sector in agg["sector"].values:
+                st.session_state.view = "sector"
+                st.session_state.sel_sector = clicked_sector
+                st.rerun()
+        except Exception:
+            pass
+
+    # Button fallback: every sector as a clickable button
+    st.markdown("**Or pick a sector:**")
+    cols_per_row = 4
+    for i in range(0, len(agg), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, (_, row) in enumerate(agg.iloc[i:i+cols_per_row].iterrows()):
+            with cols[j]:
+                label = f"{row['sector']} ({row['companies']})"
+                if st.button(label, key=f"sec_btn_{row['sector']}", use_container_width=True):
+                    st.session_state.view = "sector"
+                    st.session_state.sel_sector = row["sector"]
+                    st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW: SECTOR (chart + table)
+# ═══════════════════════════════════════════════════════════════════════════
+
+elif view == "sector":
+    sec = st.session_state.sel_sector
+    df = scoped[scoped["sector"] == sec].copy().sort_values("market_cap_cr", ascending=False, na_position="last")
+
+    st.markdown(f"### {sec} — {len(df)} companies")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Companies", len(df))
+    c2.metric("Market cap", fmt_cr(df["market_cap_cr"].sum()))
+    c3.metric("Revenue", fmt_cr(df["revenue_cr"].sum()))
+    c4.metric("PAT", fmt_cr(df["profit_cr"].sum()))
+
+    # Top companies chart (clickable)
+    st.markdown("#### Top companies by market cap — click a bar to view detail")
+    top_n = df.head(20).copy()
+    if not top_n.empty:
+        fig = px.bar(
+            top_n, x="market_cap_cr", y="name", orientation="h",
+            text=top_n["market_cap_cr"].apply(fmt_cr),
+            custom_data=["ticker", "name"],
+            labels={"market_cap_cr": "Market cap (₹ Cr)", "name": ""},
+            height=max(350, 28 * len(top_n)),
+        )
+        fig.update_traces(
+            marker_color="#1D9E75", textposition="outside",
+            hovertemplate="<b>%{customdata[1]}</b><br>Market cap: ₹%{x:,.0f} Cr<extra></extra>",
+        )
+        fig.update_layout(
+            yaxis={"categoryorder": "total ascending"},
+            margin=dict(l=10, r=80, t=10, b=10),
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="rgba(255,255,255,0.8)"),
+        )
+        event = st.plotly_chart(
+            fig, use_container_width=True,
+            on_select="rerun", selection_mode="points",
+            key=f"co_chart_{sec}",
+        )
+        if event and hasattr(event, "selection") and event.selection.get("points"):
+            try:
+                cd = event.selection["points"][0].get("customdata")
+                if cd:
+                    st.session_state.view = "company"
+                    st.session_state.sel_company = cd[0]
+                    st.rerun()
+            except Exception:
+                pass
+
+    # Full table
+    st.markdown("#### All companies in sector — click a row to view detail")
     display = df[["ticker", "name", "city", "market_cap_cr", "revenue_cr",
-                  "profit_cr", "roe_pct", "pe", "revenue_growth_yoy", "debt_to_equity"]].copy()
+                  "profit_cr", "roe_pct", "pe", "revenue_growth_yoy"]].copy()
     display["market_cap_cr"] = display["market_cap_cr"].apply(fmt_cr)
     display["revenue_cr"] = display["revenue_cr"].apply(fmt_cr)
     display["profit_cr"] = display["profit_cr"].apply(fmt_cr)
     display["roe_pct"] = display["roe_pct"].apply(lambda x: fmt_num(x, "%"))
     display["pe"] = display["pe"].apply(fmt_num)
     display["revenue_growth_yoy"] = display["revenue_growth_yoy"].apply(lambda x: fmt_num(x, "%"))
-    display["debt_to_equity"] = display["debt_to_equity"].apply(fmt_num)
-    display.columns = ["Ticker", "Name", "City", "M.Cap", "Revenue", "PAT", "RoE", "P/E", "Growth", "D/E"]
+    display.columns = ["Ticker", "Name", "City", "M.Cap", "Revenue", "PAT", "RoE", "P/E", "Growth"]
 
     event = st.dataframe(
-        display,
-        hide_index=True,
-        use_container_width=True,
-        height=520,
-        on_select="rerun",
-        selection_mode="multi-row",
+        display, hide_index=True, use_container_width=True, height=420,
+        on_select="rerun", selection_mode="single-row",
     )
-
-    sel = event.selection.rows if event and hasattr(event, "selection") else []
-
-    a1, a2, a3 = st.columns([1, 1, 4])
-    with a1:
-        if len(sel) == 1:
-            if st.button("📊 View detail", use_container_width=True, type="primary"):
-                st.session_state.view = "company"
-                st.session_state.sel_company = df.iloc[sel[0]]["ticker"]
-                st.rerun()
-    with a2:
-        if len(sel) >= 2:
-            if st.button(f"⚖️ Compare {len(sel)}", use_container_width=True, type="primary"):
-                st.session_state.compare_tickers = df.iloc[sel]["ticker"].tolist()
-                st.session_state.view = "compare"
-                st.rerun()
-    with a3:
-        if not sel:
-            st.caption("Click a row to select. 1 row → detail. 2+ rows → compare.")
-        elif len(sel) == 1:
-            st.caption(f"Selected: {df.iloc[sel[0]]['name']}")
-        else:
-            st.caption(f"{len(sel)} companies selected")
+    if event.selection.rows:
+        sel = df.iloc[event.selection.rows[0]]
+        if st.button(f"📊 View {sel['name']} details →", type="primary"):
+            st.session_state.view = "company"
+            st.session_state.sel_company = sel["ticker"]
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VIEW 3: COMPANY DETAIL
+# VIEW: COMPANY DETAIL
 # ═══════════════════════════════════════════════════════════════════════════
 
 elif view == "company":
@@ -381,20 +413,20 @@ elif view == "company":
     c6.metric("EPS", fmt_num(row.get("eps")))
     c7.metric("D/E", fmt_num(row.get("debt_to_equity")))
     c8.metric("Div yield", fmt_num(row.get("dividend_yield_pct"), "%"))
-    c9.metric("Rev growth YoY", fmt_num(row.get("revenue_growth_yoy"), "%"))
+    c9.metric("Rev growth", fmt_num(row.get("revenue_growth_yoy"), "%"))
     c10.metric("Latest FY end", row.get("latest_fy_end") or "—")
 
     st.markdown("### Revenue & PAT history")
     hist = fetch_company_history(tk)
     if hist.empty:
-        st.warning("Annual financial history not available from Yahoo for this ticker.")
+        st.info("Annual financial history not available for this ticker.")
     else:
         fig = go.Figure()
         fig.add_trace(go.Bar(x=hist.index, y=hist["revenue_cr"], name="Revenue", marker_color="#378ADD"))
         fig.add_trace(go.Bar(x=hist.index, y=hist["profit_cr"], name="PAT", marker_color="#1D9E75"))
         fig.update_layout(
             barmode="group", xaxis_title="Period end", yaxis_title="₹ Cr",
-            height=380, margin=dict(l=10, r=10, t=10, b=10),
+            height=360, margin=dict(l=10, r=10, t=10, b=10),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -409,7 +441,7 @@ elif view == "company":
         fig = px.line(pxh, y="Close")
         fig.update_traces(line_color="#534AB7", line_width=2)
         fig.update_layout(
-            height=320, margin=dict(l=10, r=10, t=10, b=10),
+            height=300, margin=dict(l=10, r=10, t=10, b=10),
             xaxis_title="", yaxis_title="Close (₹)", showlegend=False,
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
@@ -417,93 +449,10 @@ elif view == "company":
         st.plotly_chart(fig, use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# VIEW 4: COMPARE
-# ═══════════════════════════════════════════════════════════════════════════
-
-elif view == "compare":
-    tickers = st.session_state.get("compare_tickers", [])
-    if len(tickers) < 2:
-        st.error("Select 2+ companies from the company list to compare.")
-        st.stop()
-
-    df = companies[companies["ticker"].isin(tickers)].set_index("ticker").loc[tickers]
-
-    st.markdown(f"### Comparing {len(tickers)} companies")
-
-    metric_rows = [
-        ("Market cap (₹ Cr)", "market_cap_cr", "max"),
-        ("Revenue (₹ Cr)", "revenue_cr", "max"),
-        ("PAT (₹ Cr)", "profit_cr", "max"),
-        ("RoE %", "roe_pct", "max"),
-        ("P/E", "pe", "min"),
-        ("D/E", "debt_to_equity", "min"),
-        ("Revenue growth %", "revenue_growth_yoy", "max"),
-        ("Dividend yield %", "dividend_yield_pct", "max"),
-    ]
-    rows = {label: {tk: df.loc[tk, col] for tk in tickers} for label, col, _ in metric_rows}
-    compare_df = pd.DataFrame(rows).T
-
-    def style_row(row, mode):
-        vals = pd.to_numeric(row, errors="coerce")
-        if vals.dropna().empty:
-            return [""] * len(row)
-        best = vals.min() if mode == "min" else vals.max()
-        return ["font-weight: 600; color: #1D9E75" if v == best else "" for v in vals]
-
-    styled = compare_df.style
-    for label, _, mode in metric_rows:
-        styled = styled.apply(
-            lambda r, m=mode: style_row(r, m), axis=1, subset=pd.IndexSlice[label, :]
-        )
-    styled = styled.format(lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) and pd.notna(v) else "—")
-    st.dataframe(styled, use_container_width=True)
-    st.caption("Green = best in row. Lower is better for P/E, D/E.")
-
-    st.markdown("### Revenue history overlay")
-    colors = ["#378ADD", "#1D9E75", "#D85A30", "#7F77DD", "#EF9F27", "#D4537E"]
-    fig = go.Figure()
-    for i, tk in enumerate(tickers):
-        hist = fetch_company_history(tk)
-        if not hist.empty:
-            fig.add_trace(go.Scatter(
-                x=hist.index, y=hist["revenue_cr"],
-                name=tk, mode="lines+markers",
-                line=dict(color=colors[i % len(colors)], width=2),
-            ))
-    fig.update_layout(
-        xaxis_title="Period end", yaxis_title="Revenue (₹ Cr)",
-        height=400, margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="rgba(255,255,255,0.8)"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# ─── Footer with FY attribution ────────────────────────────────────────────
+# ─── Footer ────────────────────────────────────────────────────────────────
 
 st.divider()
-
-fy_min = fy_max = None
-if "latest_fy_end" in companies.columns:
-    fy_dates = pd.to_datetime(companies["latest_fy_end"], errors="coerce").dropna()
-    if not fy_dates.empty:
-        fy_min = fy_dates.min().strftime("%b %Y")
-        fy_max = fy_dates.max().strftime("%b %Y")
-
-fy_text = f"FY ends range **{fy_min} → {fy_max}**" if fy_min else "latest annual filings"
-
-st.markdown(
-    f"<div style='font-size:11px; color:rgba(255,255,255,0.45); line-height:1.6;'>"
-    f"<b>Data source:</b> NSE official equity list + Yahoo Finance · "
-    f"<b>Coverage:</b> {len(companies):,} NSE-listed equities with valid market cap and financials "
-    f"(out of ~2,100 total — smaller stocks with broken Yahoo data are excluded) · "
-    f"<b>Refresh:</b> automated daily at 07:00 IST via GitHub Actions · "
-    f"<b>Financials:</b> reflect each company's most recent annual report ({fy_text}). "
-    f"Indian FY ends Mar 31, but some cos report calendar year. "
-    f"<b>Disclaimer:</b> always cross-verify with official filings before taking decisions. "
-    f"Yahoo Finance city/sector data has known gaps for Indian smallcaps."
-    f"</div>",
-    unsafe_allow_html=True,
+st.caption(
+    f"Data: Yahoo Finance · {len(companies):,} NSE-listed companies indexed · "
+    f"Auto-refreshed daily via GitHub Actions"
 )

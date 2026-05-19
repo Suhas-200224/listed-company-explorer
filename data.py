@@ -1,11 +1,7 @@
 """Data layer.
 
-Reads the auto-refreshed companies_enriched.csv if present (created by the
-GitHub Actions workflow). Falls back to a small seed list otherwise so the
-app works on first deploy before the first refresh completes.
-
-Live price/financial history for the detail view still comes from yfinance
-on demand, cached for 1 hour.
+Reads auto-refreshed companies_enriched.csv (built daily by GitHub Actions).
+Falls back to a small seed list before first refresh runs.
 """
 
 import pandas as pd
@@ -19,18 +15,16 @@ SEED = ROOT / "companies_seed.csv"
 CR = 1e7
 
 
-@st.cache_data(ttl=900)  # 15 min — the file is updated daily, no need for shorter
+@st.cache_data(ttl=900)
 def load_companies() -> tuple[pd.DataFrame, str]:
-    """Return (df, source_label). source_label tells the UI which file we used."""
     if ENRICHED.exists():
         df = pd.read_csv(ENRICHED)
         return df, "enriched"
     if SEED.exists():
         df = pd.read_csv(SEED)
-        # Seed has fewer columns; pad to keep app code uniform
         for col in ["industry", "state", "market_cap_cr", "revenue_cr", "profit_cr",
                     "revenue_growth_yoy", "pe", "eps", "roe_pct", "debt_to_equity",
-                    "dividend_yield_pct"]:
+                    "dividend_yield_pct", "latest_fy_end"]:
             if col not in df.columns:
                 df[col] = None
         return df, "seed"
@@ -39,7 +33,6 @@ def load_companies() -> tuple[pd.DataFrame, str]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_history(ticker: str) -> pd.DataFrame:
-    """Multi-year revenue + PAT history for the detail view."""
     try:
         t = yf.Ticker(ticker)
         fin = t.financials
@@ -58,7 +51,6 @@ def fetch_company_history(ticker: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_price_history(ticker: str, period: str = "5y") -> pd.DataFrame:
-    """Daily close prices for the given period."""
     try:
         t = yf.Ticker(ticker)
         h = t.history(period=period)

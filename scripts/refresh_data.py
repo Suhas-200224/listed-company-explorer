@@ -1,198 +1,357 @@
-"""Auto-refresh script v2.
+"""Auto-refresh script v3 — Screener.in scraper.
 
-Changes from v1:
-- City normalization. Yahoo Finance's city field is inconsistent for Indian
-  companies (Secunderabad, HITEC City, etc.). We collapse Telangana state
-  entries to Hyderabad and normalize common synonyms. This significantly
-  improves geo-filtering accuracy.
-- Captures latest_fy_end so the app can show what financial year the numbers
-  reflect (Indian FYs typically end March 31).
+Replaces Yahoo Finance with Screener.in for comprehensive Indian listed
+company coverage (~2,000-2,500 NSE+BSE companies vs ~600 with Yahoo).
+
+How it works:
+1. Discovers all companies with market cap > 0 from Screener's screen tool
+2. For each company, scrapes the detail page for fundamentals + address
+3. Extracts city/state from the company's About section text
+4. Writes enriched CSV
+
+Runs daily via GitHub Actions. Takes 30-45 minutes per refresh.
 """
 
 import io
+import re
 import time
 import requests
 import pandas as pd
-import yfinance as yf
+from bs4 import BeautifulSoup
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-NSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+SCREENER_BASE = "https://www.screener.in"
 OUTPUT = Path(__file__).parent.parent / "data" / "companies_enriched.csv"
-CR = 1e7
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/csv,application/csv,*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# City synonyms → canonical name
-CITY_NORMALIZATION = {
+# ─── Location normalization ─────────────────────────────────────────────────
+
+CITY_KEYWORDS = {
+    "hyderabad": "Hyderabad",
     "secunderabad": "Hyderabad",
     "hitec city": "Hyderabad",
     "gachibowli": "Hyderabad",
     "kondapur": "Hyderabad",
-    "madhapur": "Hyderabad",
-    "sangareddy": "Hyderabad",
-    "medchal": "Hyderabad",
+    "navi mumbai": "Mumbai",
+    "mumbai": "Mumbai",
+    "bombay": "Mumbai",
+    "thane": "Mumbai",
     "bengaluru": "Bangalore",
     "bangalore": "Bangalore",
-    "bombay": "Mumbai",
-    "mumbai": "Mumbai",
-    "navi mumbai": "Mumbai",
-    "thane": "Mumbai",
     "new delhi": "Delhi",
     "delhi": "Delhi",
     "gurugram": "Gurgaon",
     "gurgaon": "Gurgaon",
+    "noida": "Noida",
     "kolkata": "Kolkata",
     "calcutta": "Kolkata",
     "chennai": "Chennai",
     "madras": "Chennai",
     "pune": "Pune",
     "ahmedabad": "Ahmedabad",
-    "noida": "Noida",
     "kochi": "Kochi",
     "cochin": "Kochi",
-    "thiruvananthapuram": "Trivandrum",
-    "trivandrum": "Trivandrum",
     "vadodara": "Vadodara",
-    "baroda": "Vadodara",
+    "jaipur": "Jaipur",
+    "chandigarh": "Chandigarh",
+    "indore": "Indore",
+    "lucknow": "Lucknow",
+    "coimbatore": "Coimbatore",
+    "vizag": "Visakhapatnam",
+    "visakhapatnam": "Visakhapatnam",
 }
 
-# When city missing/unknown, fall back to state's main commercial center
-STATE_DEFAULT_CITY = {
-    "telangana": "Hyderabad",
-    "maharashtra": "Mumbai",
-    "karnataka": "Bangalore",
-    "tamil nadu": "Chennai",
+STATE_KEYWORDS = {
+    "telangana": "Telangana",
+    "andhra pradesh": "Andhra Pradesh",
+    "maharashtra": "Maharashtra",
+    "karnataka": "Karnataka",
+    "tamil nadu": "Tamil Nadu",
+    "west bengal": "West Bengal",
+    "gujarat": "Gujarat",
+    "kerala": "Kerala",
+    "rajasthan": "Rajasthan",
+    "punjab": "Punjab",
+    "haryana": "Haryana",
+    "uttar pradesh": "Uttar Pradesh",
+    "madhya pradesh": "Madhya Pradesh",
     "delhi": "Delhi",
-    "west bengal": "Kolkata",
-    "gujarat": "Ahmedabad",
-    "andhra pradesh": "Visakhapatnam",
-    "kerala": "Kochi",
-    "rajasthan": "Jaipur",
-    "punjab": "Chandigarh",
-    "haryana": "Gurgaon",
-    "uttar pradesh": "Noida",
+    "odisha": "Odisha",
+    "bihar": "Bihar",
+    "chhattisgarh": "Chhattisgarh",
+    "jharkhand": "Jharkhand",
+    "assam": "Assam",
+    "uttarakhand": "Uttarakhand",
+    "himachal pradesh": "Himachal Pradesh",
+    "jammu and kashmir": "Jammu and Kashmir",
+    "goa": "Goa",
 }
 
 
-def normalize_location(city: str, state: str) -> tuple[str, str]:
-    """Return (canonical_city, canonical_state)."""
-    city = (city or "").strip()
-    state = (state or "").strip()
-    state_norm = state.title() if state else "Unknown"
-
-    # Telangana special case: 95%+ of listed cos are in Hyderabad metro region.
-    # Collapse all Telangana entries to Hyderabad regardless of yfinance city.
-    if state.lower() == "telangana":
-        return "Hyderabad", state_norm
-
-    # Known synonym
-    if city.lower() in CITY_NORMALIZATION:
-        return CITY_NORMALIZATION[city.lower()], state_norm
-
-    # City present but unrecognized → use as-is (title case)
-    if city:
-        return city.title(), state_norm
-
-    # No city → use state default
-    if state.lower() in STATE_DEFAULT_CITY:
-        return STATE_DEFAULT_CITY[state.lower()], state_norm
-
-    return "Unknown", state_norm
+def extract_location(text: str) -> tuple[str, str]:
+    """Extract canonical city, state from address-like text."""
+    if not text:
+        return "Unknown", "Unknown"
+    text_lower = text.lower()
+    state = "Unknown"
+    for kw, canonical in STATE_KEYWORDS.items():
+        if kw in text_lower:
+            state = canonical
+            break
+    city = "Unknown"
+    for kw, canonical in CITY_KEYWORDS.items():
+        if kw in text_lower:
+            city = canonical
+            break
+    # Telangana → Hyderabad fallback
+    if state == "Telangana" and city == "Unknown":
+        city = "Hyderabad"
+    return city, state
 
 
-def fetch_nse_universe() -> list[str]:
-    print(f"[1/2] Fetching NSE master list from {NSE_URL}")
-    r = requests.get(NSE_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.BytesIO(r.content))
-    df.columns = [c.strip() for c in df.columns]
-    if "SERIES" in df.columns:
-        df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
-    symbols = df["SYMBOL"].astype(str).str.strip().tolist()
-    print(f"      Found {len(symbols)} NSE-listed equities (EQ series)")
-    return symbols
+# ─── Number parsing ─────────────────────────────────────────────────────────
 
-
-def enrich_ticker(symbol: str) -> dict | None:
+def parse_number(s) -> float | None:
+    """Parse Indian financial strings like '₹ 1,76,234 Cr.', '12.5%', '4.85'."""
+    if not s:
+        return None
+    s = str(s).strip()
+    # Take portion before any %, /, etc
+    s = re.split(r'[/%]', s)[0]
+    cleaned = re.sub(r'[^\d.\-]', '', s)
     try:
-        t = yf.Ticker(f"{symbol}.NS")
-        info = t.info or {}
-        mcap = info.get("marketCap")
-        if not mcap or mcap <= 0:
-            return None
-
-        city, state = normalize_location(info.get("city"), info.get("state"))
-
-        revenue = profit = growth = None
-        latest_fy = None
-        try:
-            fin = t.financials
-            if isinstance(fin, pd.DataFrame) and not fin.empty:
-                cols = sorted(fin.columns, reverse=True)
-                if cols and hasattr(cols[0], "strftime"):
-                    latest_fy = cols[0].strftime("%Y-%m-%d")
-                if "Total Revenue" in fin.index and cols:
-                    revenue = fin.loc["Total Revenue", cols[0]] / CR
-                    if len(cols) >= 2:
-                        prev = fin.loc["Total Revenue", cols[1]]
-                        if prev and prev != 0:
-                            growth = ((fin.loc["Total Revenue", cols[0]] - prev) / abs(prev)) * 100
-                if "Net Income" in fin.index and cols:
-                    profit = fin.loc["Net Income", cols[0]] / CR
-        except Exception:
-            pass
-
-        return {
-            "ticker": f"{symbol}.NS",
-            "name": info.get("longName") or info.get("shortName") or symbol,
-            "sector": info.get("sector") or "Unknown",
-            "industry": info.get("industry") or "Unknown",
-            "city": city,
-            "state": state,
-            "market_cap_cr": mcap / CR,
-            "revenue_cr": revenue,
-            "profit_cr": profit,
-            "revenue_growth_yoy": growth,
-            "pe": info.get("trailingPE"),
-            "eps": info.get("trailingEps"),
-            "roe_pct": (info.get("returnOnEquity") or 0) * 100 if info.get("returnOnEquity") else None,
-            "debt_to_equity": (info.get("debtToEquity") or 0) / 100 if info.get("debtToEquity") else None,
-            "dividend_yield_pct": (info.get("dividendYield") or 0) * 100 if info.get("dividendYield") else None,
-            "latest_fy_end": latest_fy,
-        }
-    except Exception:
+        return float(cleaned)
+    except (ValueError, TypeError):
         return None
 
 
+# ─── Universe discovery ────────────────────────────────────────────────────
+
+def fetch_universe() -> list[str]:
+    """Get all company codes from Screener's screen tool (mcap > 0)."""
+    print("[1/2] Discovering listed company universe via Screener.in screen...")
+    codes = set()
+    consecutive_empty = 0
+
+    for page in range(1, 250):
+        url = (
+            f"{SCREENER_BASE}/screen/raw/"
+            f"?sort=&source=&order=&page={page}"
+            f"&query=Market+Capitalization+%3E+0"
+        )
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code != 200:
+                if r.status_code == 429:
+                    print(f"      Page {page}: rate limited, pausing 10s")
+                    time.sleep(10)
+                    continue
+                break
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            page_codes = set()
+            for a in soup.select('a[href^="/company/"]'):
+                href = a.get("href", "")
+                m = re.match(r"^/company/([^/]+)/?", href)
+                if m:
+                    page_codes.add(m.group(1))
+
+            if not page_codes:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+                codes.update(page_codes)
+
+            if page % 20 == 0:
+                print(f"      Page {page}: {len(codes)} unique cos so far")
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"      Page {page} error: {e}")
+            continue
+
+    print(f"      Universe size: {len(codes)} companies")
+    return list(codes)
+
+
+# ─── Per-company scraping ──────────────────────────────────────────────────
+
+def scrape_company(code: str) -> dict | None:
+    """Scrape a single company detail page from Screener."""
+    # Try consolidated first (better data), fall back to standalone
+    r = None
+    for endpoint in ("consolidated/", ""):
+        url = f"{SCREENER_BASE}/company/{code}/{endpoint}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r and r.status_code == 200 and "Page not found" not in r.text[:5000]:
+                break
+        except Exception:
+            r = None
+    if not r or r.status_code != 200:
+        return None
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    h1 = soup.find("h1")
+    name = h1.get_text(strip=True) if h1 else None
+    if not name:
+        return None
+
+    # Top ratios — try the standard Screener structure
+    ratios = {}
+    # Primary structure: ul#top-ratios > li with name + number/value spans
+    for li in soup.select("ul#top-ratios > li"):
+        name_span = li.find("span", class_="name")
+        value_span = li.find("span", class_=re.compile(r"(value|number)"))
+        if name_span and value_span:
+            ratios[name_span.get_text(strip=True)] = value_span.get_text(strip=True)
+
+    # Fallback for slightly different structure
+    if not ratios:
+        for li in soup.find_all("li", class_=re.compile(r"flex")):
+            spans = li.find_all("span")
+            if len(spans) >= 2:
+                label = spans[0].get_text(strip=True)
+                value = spans[-1].get_text(strip=True)
+                if label and value and len(label) < 30:
+                    ratios.setdefault(label, value)
+
+    mcap = parse_number(ratios.get("Market Cap"))
+    if not mcap or mcap <= 0:
+        return None
+
+    # About text — for address extraction. Try multiple selectors.
+    about_text = ""
+    about_div = soup.find("div", class_="company-profile") or soup.find("div", class_="about")
+    if about_div:
+        about_text = about_div.get_text(separator=" ", strip=True)
+    if not about_text:
+        # Find About heading and grab following paragraphs
+        for h in soup.find_all(["h2", "h3"]):
+            if h.get_text(strip=True).lower().startswith("about"):
+                parts = []
+                for sib in h.find_next_siblings():
+                    if sib.name in ("h2", "h3"):
+                        break
+                    parts.append(sib.get_text(separator=" ", strip=True))
+                about_text = " ".join(parts)
+                break
+
+    # Sector / industry from peer comparison links
+    sector = industry = None
+    for link in soup.select('a[href*="/screen/"]'):
+        href = link.get("href", "")
+        text = link.get_text(strip=True)
+        if not text or len(text) > 50 or text.isdigit():
+            continue
+        if "sector_name" in href and not sector:
+            sector = text
+        elif "industry_name" in href and not industry:
+            industry = text
+
+    # PnL latest annual values
+    revenue = profit = latest_fy = None
+    pnl = soup.find("section", id="profit-loss")
+    if pnl:
+        table = pnl.find("table")
+        if table:
+            thead = table.find("thead")
+            if thead:
+                cols = [th.get_text(strip=True) for th in thead.find_all("th")]
+                if len(cols) >= 2:
+                    latest_fy = cols[-1]
+            tbody = table.find("tbody")
+            if tbody:
+                for tr in tbody.find_all("tr"):
+                    cells = tr.find_all("td")
+                    if len(cells) < 2:
+                        continue
+                    row_label = cells[0].get_text(strip=True).rstrip("+").strip().lower()
+                    latest_val = cells[-1].get_text(strip=True)
+                    if row_label in ("sales", "revenue"):
+                        revenue = parse_number(latest_val)
+                    elif row_label == "net profit":
+                        profit = parse_number(latest_val)
+
+    city, state = extract_location(about_text)
+
+    return {
+        "ticker": f"{code}.NS",
+        "name": name,
+        "sector": sector or "Unknown",
+        "industry": industry or "Unknown",
+        "city": city,
+        "state": state,
+        "market_cap_cr": mcap,
+        "revenue_cr": revenue,
+        "profit_cr": profit,
+        "revenue_growth_yoy": None,
+        "pe": parse_number(ratios.get("Stock P/E")),
+        "eps": None,
+        "roe_pct": parse_number(ratios.get("ROE")),
+        "roce_pct": parse_number(ratios.get("ROCE")),
+        "debt_to_equity": None,
+        "dividend_yield_pct": parse_number(ratios.get("Dividend Yield")),
+        "book_value": parse_number(ratios.get("Book Value")),
+        "current_price": parse_number(ratios.get("Current Price")),
+        "face_value": parse_number(ratios.get("Face Value")),
+        "latest_fy_end": latest_fy,
+    }
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
+
 def main():
-    symbols = fetch_nse_universe()
-    print(f"[2/2] Enriching {len(symbols)} tickers via Yahoo Finance (12 parallel workers)")
+    universe = fetch_universe()
+    if not universe:
+        print("FATAL: empty universe — Screener fetch failed")
+        return
+
+    print(f"[2/2] Scraping {len(universe)} company detail pages (3 workers)")
     rows = []
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(enrich_ticker, s): s for s in symbols}
-        for i, fut in enumerate(as_completed(futures)):
-            if (i + 1) % 100 == 0:
-                print(f"      Progress: {i+1}/{len(symbols)} done, {len(rows)} with data")
+    completed = 0
+    last_save_count = 0
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(scrape_company, c): c for c in universe}
+        for fut in as_completed(futures):
+            completed += 1
             try:
-                result = fut.result(timeout=20)
+                result = fut.result(timeout=30)
                 if result:
                     rows.append(result)
             except Exception:
-                continue
+                pass
 
-    df = pd.DataFrame(rows).sort_values("market_cap_cr", ascending=False)
+            if completed % 100 == 0:
+                print(f"      Progress: {completed}/{len(universe)} done, {len(rows)} with data")
+                # Periodic save so even partial runs are useful
+                if len(rows) - last_save_count >= 300:
+                    pd.DataFrame(rows).sort_values(
+                        "market_cap_cr", ascending=False, na_position="last"
+                    ).to_csv(OUTPUT, index=False)
+                    last_save_count = len(rows)
+
+    df = pd.DataFrame(rows).sort_values("market_cap_cr", ascending=False, na_position="last")
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT, index=False)
-    print(f"      Wrote {len(df)} companies to {OUTPUT}")
-    print(f"      Sectors: {df['sector'].nunique()} | Cities: {df['city'].nunique()}")
-    if "latest_fy_end" in df.columns:
-        fy = df["latest_fy_end"].dropna()
-        if not fy.empty:
-            print(f"      FY end dates: {fy.min()} → {fy.max()}")
+
+    print(f"\n[Done] Wrote {len(df)} companies to {OUTPUT}")
+    print(f"       Sectors discovered: {df['sector'].nunique()}")
+    print(f"       Cities discovered: {df['city'].nunique()}")
+    if "city" in df.columns:
+        for city in ("Hyderabad", "Mumbai", "Bangalore", "Delhi", "Chennai"):
+            count = (df["city"] == city).sum()
+            print(f"       {city}: {count} cos")
 
 
 if __name__ == "__main__":
